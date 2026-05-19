@@ -171,6 +171,21 @@ def _fetch_nasdaq_trader_universe() -> list[str]:
     return sorted(symbols)
 
 
+def _fetch_wiki_symbols(url: str, label: str) -> list[str]:
+    print(f"  Fetching {label}...")
+    try:
+        tables = _read_wiki_tables(url)
+        for tbl in tables:
+            cols = [c.lower() for c in tbl.columns.astype(str)]
+            for c in ("symbol", "ticker"):
+                if c in cols:
+                    col = tbl.columns[cols.index(c)]
+                    return tbl[col].astype(str).str.replace(".", "-", regex=False).tolist()
+    except Exception as e:
+        print(f"  {label} fetch failed ({e})")
+    return []
+
+
 def fetch_ticker_universe(scope: str = "russell1000") -> list[str]:
     """
     Pull tickers for the chosen scope.
@@ -182,15 +197,21 @@ def fetch_ticker_universe(scope: str = "russell1000") -> list[str]:
     print(f"Building universe (scope='{scope}')...")
     syms: set[str] = set()
 
-    if scope in ("sp500", "russell1000", "russell3000"):
-        print("  Fetching S&P 500...")
-        try:
-            sp500 = _read_wiki_tables(
-                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            )[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-            syms.update(sp500)
-        except Exception as e:
-            print(f"  S&P 500 fetch failed ({e})")
+    if scope in ("sp500", "sp1500", "russell1000", "russell3000"):
+        syms.update(_fetch_wiki_symbols(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            "S&P 500",
+        ))
+
+    if scope == "sp1500":
+        syms.update(_fetch_wiki_symbols(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+            "S&P MidCap 400",
+        ))
+        syms.update(_fetch_wiki_symbols(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
+            "S&P SmallCap 600",
+        ))
 
     if scope in ("russell1000", "russell3000"):
         print("  Fetching Russell 1000...")
@@ -229,7 +250,7 @@ def load_or_build_tickers(scope: str | None = None) -> list[str]:
     """
     Load tickers from tickers.txt, or build a fresh list.
     Override the universe size with env var SCREENER_SCOPE or the scope arg:
-      sp500 | russell1000 (default) | russell3000 | us_listed | sec_all
+      sp500 | sp1500 | russell1000 (default) | russell3000 | us_listed | sec_all
     """
     env_scope = os.environ.get("SCREENER_SCOPE")
     scope = (scope or env_scope or "russell1000").lower()
