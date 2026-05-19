@@ -6,6 +6,7 @@ highlighting "growth with a bit of risk" candidates.
 
 import json
 import os
+import random
 import ssl
 import sqlite3
 import subprocess
@@ -57,6 +58,8 @@ MAX_WORKERS = 20          # concurrent yfinance fetches — 20 is the sweet spot
 PROGRESS_EVERY = 100      # print a progress line every N tickers
 CACHE_HOURS = 12          # reuse last fetch if newer than this (set 0 to disable)
 CACHE_FILE = Path(__file__).parent / "_fetch_cache_v5_edgar.parquet"
+MAX_WORKERS = int(os.environ.get("SCREENER_MAX_WORKERS", str(MAX_WORKERS)))
+SHUFFLE_SEED = int(os.environ.get("SCREENER_SHUFFLE_SEED", "42"))
 
 # ---------- SEC EDGAR config ----------
 USE_EDGAR = True                                          # set False to skip XBRL layer
@@ -970,12 +973,20 @@ def fetch_all(tickers: list[str]) -> pd.DataFrame:
     if cached is not None:
         return cached
 
+    tickers = list(tickers)
     total = len(tickers)
+    workers = MAX_WORKERS
+    if total > 3000 and "SCREENER_MAX_WORKERS" not in os.environ:
+        workers = min(workers, 5)
+    if total > 2000:
+        rng = random.Random(SHUFFLE_SEED)
+        rng.shuffle(tickers)
+        print(f"Shuffled large universe with seed {SHUFFLE_SEED} to avoid alphabet bias.")
     all_rows: list[dict] = []
     start = time.time()
-    print(f"Fetching {total} tickers with {MAX_WORKERS} parallel workers...")
+    print(f"Fetching {total} tickers with {workers} parallel workers...")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(fetch_one, sym): sym for sym in tickers}
         for i, fut in enumerate(as_completed(futures), start=1):
             all_rows.append(fut.result())
