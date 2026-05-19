@@ -1024,6 +1024,19 @@ def fetch_all(tickers: list[str]) -> pd.DataFrame:
     elapsed = time.time() - start
     print(f"Fetch done in {elapsed:.1f}s ({total / elapsed:.1f} tickers/s).")
 
+    usable = df["error"].isna() if "error" in df.columns else pd.Series(True, index=df.index)
+    if "currentPrice" in df.columns:
+        usable = usable & pd.to_numeric(df["currentPrice"], errors="coerce").notna()
+    usable_count = int(usable.sum())
+    min_usable = int(os.environ.get("SCREENER_MIN_USABLE_ROWS", "10"))
+    if total >= 100 and usable_count < min_usable:
+        raise RuntimeError(
+            f"Only {usable_count}/{total} tickers returned usable Yahoo data. "
+            "Yahoo likely rate-limited or rejected this batch, so the prior database "
+            "was left untouched. Wait a few minutes, lower SCREENER_MAX_WORKERS, "
+            "or use SCREENER_SCOPE=sp1500/sp500."
+        )
+
     try:
         sanitize_for_storage(df).to_parquet(CACHE_FILE, index=False)
         print(f"Cached fetch to {CACHE_FILE.name}")
@@ -1106,6 +1119,11 @@ def sanitize_for_storage(df: pd.DataFrame) -> pd.DataFrame:
 
 def save_to_sqlite(df: pd.DataFrame) -> None:
     safe = sanitize_for_storage(df)
+    if "error" in safe.columns and len(safe):
+        clean_rows = int(safe["error"].isna().sum())
+        if clean_rows == 0:
+            print(f"Skipped SQLite write: all {len(safe)} rows contain fetch errors.")
+            return
     with sqlite3.connect(DB_FILE) as conn:
         # Detect schema mismatch with prior runs and rebuild if columns changed
         existing_cols = set()
