@@ -6,6 +6,7 @@ highlighting "growth with a bit of risk" candidates.
 
 import json
 import os
+import ssl
 import sqlite3
 import subprocess
 import sys
@@ -108,41 +109,130 @@ FILTERS = {
 
 # ---------- Ticker universe ----------
 
-def fetch_ticker_universe() -> list[str]:
-    """Pull S&P 500 from Wikipedia and merge with a Russell-1000 proxy."""
-    print("Fetching S&P 500 from Wikipedia...")
-    sp500 = _read_wiki_tables(
-        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    )[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-
-    print("Fetching Russell 1000 from Wikipedia...")
+def _fetch_sec_full_universe() -> list[str]:
+    """Use the SEC's ticker→CIK map (~10k US registrants) as the universe."""
+    print("Fetching full SEC US registrant universe...")
     try:
-        r1000 = _read_wiki_tables(
-            "https://en.wikipedia.org/wiki/Russell_1000_Index"
-        )
-        # The constituents table varies in position; find the one with a Ticker/Symbol column
-        r1000_syms = []
-        for tbl in r1000:
-            cols = [c.lower() for c in tbl.columns.astype(str)]
-            for c in ("symbol", "ticker"):
-                if c in cols:
-                    col = tbl.columns[cols.index(c)]
-                    r1000_syms = tbl[col].astype(str).str.replace(".", "-", regex=False).tolist()
-                    break
-            if r1000_syms:
-                break
+        mapping = _load_ticker_cik_map()
+        return sorted(mapping.keys())
     except Exception as e:
-        print(f"  Russell 1000 fetch failed ({e}); using S&P 500 only.")
-        r1000_syms = []
+        print(f"  SEC universe fetch failed ({e})")
+        return []
 
-    universe = sorted(set(sp500) | set(r1000_syms))
-    # Strip obvious junk
-    universe = [t for t in universe if t and t.isascii() and len(t) <= 6]
+
+def _fetch_russell_2000() -> list[str]:
+    """Russell 2000 constituents (small caps)."""
+    print("Fetching Russell 2000 from iShares...")
+    try:
+        # iShares IWM holdings — daily updated, no auth needed
+        url = ("https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+               "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund")
+        req = Request(url, headers={"User-Agent": WIKI_UA})
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        # File has ~9 header lines before the table
+        lines = raw.splitlines()
+        start = next((i for i, l in enumerate(lines) if l.startswith('"Ticker"')), None)
+        if start is None:
+            return []
+        df = pd.read_csv(StringIO("\n".join(lines[start:])))
+        return [t for t in df["Ticker"].dropna().astype(str).str.strip().tolist() if t]
+    except Exception as e:
+        print(f"  Russell 2000 fetch failed ({e})")
+        return []
+
+
+def _fetch_nasdaq_trader_universe() -> list[str]:
+    """All Nasdaq/NYSE/NYSE American/Arca listed symbols from Nasdaq Trader."""
+    print("Fetching broad US listed universe from Nasdaq Trader...")
+    urls = [
+        "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+    ]
+    symbols: set[str] = set()
+    for url in urls:
+        try:
+            req = Request(url, headers={"User-Agent": WIKI_UA})
+            with urlopen(req, timeout=30, context=ssl._create_unverified_context()) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            df = pd.read_csv(StringIO(raw), sep="|")
+            df = df[~df.iloc[:, 0].astype(str).str.startswith("File Creation Time", na=False)]
+            symbol_col = "Symbol" if "Symbol" in df.columns else "ACT Symbol"
+            if "Test Issue" in df.columns:
+                df = df[df["Test Issue"].fillna("N").astype(str).str.upper() != "Y"]
+            if "Financial Status" in df.columns:
+                df = df[df["Financial Status"].fillna("N").astype(str).str.upper() != "D"]
+            symbols.update(df[symbol_col].dropna().astype(str).tolist())
+        except Exception as e:
+            print(f"  Nasdaq Trader fetch failed for {url} ({e})")
+    return sorted(symbols)
+
+
+def fetch_ticker_universe(scope: str = "russell1000") -> list[str]:
+    """
+    Pull tickers for the chosen scope.
+      scope='sp500'       — ~500   S&P 500 only (fastest, blue chips)
+      scope='russell1000' — ~1500  S&P 500 + Russell 1000 (DEFAULT, mega+large caps)
+      scope='russell3000' — ~3000  R1000 + R2000 (adds small caps)
+      scope='sec_all'     — ~10000 every US SEC registrant (biggest, slowest)
+    """
+    print(f"Building universe (scope='{scope}')...")
+    syms: set[str] = set()
+
+    if scope in ("sp500", "russell1000", "russell3000"):
+        print("  Fetching S&P 500...")
+        try:
+            sp500 = _read_wiki_tables(
+                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            )[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+            syms.update(sp500)
+        except Exception as e:
+            print(f"  S&P 500 fetch failed ({e})")
+
+    if scope in ("russell1000", "russell3000"):
+        print("  Fetching Russell 1000...")
+        try:
+            r1000 = _read_wiki_tables("https://en.wikipedia.org/wiki/Russell_1000_Index")
+            for tbl in r1000:
+                cols = [c.lower() for c in tbl.columns.astype(str)]
+                for c in ("symbol", "ticker"):
+                    if c in cols:
+                        col = tbl.columns[cols.index(c)]
+                        syms.update(tbl[col].astype(str)
+                                    .str.replace(".", "-", regex=False).tolist())
+                        break
+        except Exception as e:
+            print(f"  Russell 1000 fetch failed ({e})")
+
+    if scope == "russell3000":
+        syms.update(_fetch_russell_2000())
+
+    if scope == "us_listed":
+        syms.update(_fetch_nasdaq_trader_universe())
+
+    if scope == "sec_all":
+        syms.update(_fetch_sec_full_universe())
+
+    # Clean obvious junk
+    universe = sorted({
+        t.replace(".", "-").replace("/", "-").strip().upper() for t in syms
+        if t and t.isascii() and 1 <= len(t) <= 10 and t.upper() not in {"NAN", "NONE"}
+    })
+    print(f"  Universe size: {len(universe):,} tickers")
     return universe
 
 
-def load_or_build_tickers() -> list[str]:
-    if TICKERS_FILE.exists() and TICKERS_FILE.stat().st_size > 0:
+def load_or_build_tickers(scope: str | None = None) -> list[str]:
+    """
+    Load tickers from tickers.txt, or build a fresh list.
+    Override the universe size with env var SCREENER_SCOPE or the scope arg:
+      sp500 | russell1000 (default) | russell3000 | us_listed | sec_all
+    """
+    env_scope = os.environ.get("SCREENER_SCOPE")
+    scope = (scope or env_scope or "russell1000").lower()
+    force_rebuild = bool(env_scope) and scope != "russell1000"
+
+    if TICKERS_FILE.exists() and TICKERS_FILE.stat().st_size > 0 and not force_rebuild:
         tickers = [
             line.strip().upper()
             for line in TICKERS_FILE.read_text().splitlines()
@@ -152,7 +242,9 @@ def load_or_build_tickers() -> list[str]:
         return tickers
 
     print("No tickers.txt found — building universe...")
-    tickers = fetch_ticker_universe()
+    if force_rebuild:
+        print(f"SCREENER_SCOPE={scope} set - rebuilding {TICKERS_FILE.name}...")
+    tickers = fetch_ticker_universe(scope=scope)
     TICKERS_FILE.write_text("\n".join(tickers))
     print(f"Wrote {len(tickers)} tickers to {TICKERS_FILE.name}")
     return tickers
@@ -893,6 +985,9 @@ def fetch_all(tickers: list[str]) -> pd.DataFrame:
                 print(f"  {i}/{total}  ({rate:.1f}/s, ~{eta:.0f}s left)")
 
     df = pd.DataFrame(all_rows)
+    for col in FIELDS:
+        if col not in df.columns:
+            df[col] = pd.NA
     df["fetched_at"] = datetime.now().isoformat(timespec="seconds")
     elapsed = time.time() - start
     print(f"Fetch done in {elapsed:.1f}s ({total / elapsed:.1f} tickers/s).")
@@ -1008,7 +1103,14 @@ def apply_filters(
     df: pd.DataFrame,
     verbose: bool = True,
     filters: dict | None = None,
+    strict_optional: bool = False,
 ) -> pd.DataFrame:
+    """
+    strict_optional=False (default): missing data passes optional gates
+        — don't penalize names just because a vendor metric is blank.
+    strict_optional=True: missing data FAILS optional gates
+        — required for elite screens where you want stocks that PROVE quality.
+    """
     f = FILTERS.copy()
     if filters:
         f.update(filters)
@@ -1022,6 +1124,22 @@ def apply_filters(
         return mask
 
     # Derived momentum columns — how far from 52w extremes
+    required_cols = [
+        "currentPrice", "fiftyTwoWeekLow", "fiftyTwoWeekHigh",
+        "revenueGrowth", "forwardPE", "beta", "debtToEquity",
+        "grossMargins", "marketCap",
+    ]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    complete_core = df[required_cols].notna().all(axis=1)
+    if not complete_core.all():
+        skipped = int((~complete_core).sum())
+        df = df[complete_core].copy()
+        funnel.append((f"Skipped incomplete/no-price rows ({skipped})", len(df)))
+
     df["pct_above_52w_low"] = (
         (df["currentPrice"] - df["fiftyTwoWeekLow"]) / df["fiftyTwoWeekLow"]
     )
@@ -1088,17 +1206,25 @@ def apply_filters(
             continue
         s = pd.to_numeric(df[col], errors="coerce")
         cond = (s >= thresh) if op == "ge" else (s <= thresh)
-        _gate(cond | s.isna(), f"{col} {op} {thresh}")
+        if strict_optional:
+            _gate(cond.fillna(False), f"{col} {op} {thresh} (strict)")
+        else:
+            _gate(cond | s.isna(), f"{col} {op} {thresh}")
 
     if verbose:
         print("\n=== FILTER FUNNEL ===")
         for label, n in funnel:
-            print(f"  {n:5d}  {label}")
+            safe_label = str(label).encode("ascii", errors="replace").decode("ascii")
+            print(f"  {n:5d}  {safe_label}")
 
     # Composite quality + growth + momentum + valuation score
     out = df[mask].copy()
     def _num(col, default=0):
-        return pd.to_numeric(out.get(col, default), errors="coerce").fillna(default)
+        if col in out.columns:
+            values = out[col]
+        else:
+            values = pd.Series(default, index=out.index)
+        return pd.to_numeric(values, errors="coerce").fillna(default)
 
     growth     = _num("revenueGrowth")
     off_high   = _num("pct_below_52w_high")
@@ -1430,7 +1556,11 @@ def main() -> None:
     print("\n=== TOP 20 HITS ===")
     cols = ["symbol", "shortName", "sector", "revenueGrowth", "forwardPE",
             "beta", "pct_below_52w_high", "pct_above_52w_low", "marketCap"]
-    print(hits[cols].head(20).to_string(index=False))
+    display_cols = [c for c in cols if c in hits.columns]
+    if len(hits) and display_cols:
+        print(hits[display_cols].head(20).to_string(index=False))
+    else:
+        print("No stocks matched the current theme/filter settings.")
 
     excel_file = export_excel(clean, hits, theme_keywords)
 
@@ -1439,7 +1569,11 @@ def main() -> None:
     winners_file.write_text(
         f"Top picks as of {datetime.now():%Y-%m-%d %H:%M}\n"
         + "=" * 60 + "\n"
-        + hits[cols].head(30).to_string(index=False)
+        + (
+            hits[display_cols].head(30).to_string(index=False)
+            if len(hits) and display_cols
+            else "No stocks matched the current theme/filter settings."
+        )
     )
     print(f"Wrote {winners_file.name}")
 
