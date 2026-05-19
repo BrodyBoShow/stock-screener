@@ -78,8 +78,14 @@ PRESETS = {
 }
 
 
+def data_version() -> tuple[float | None, float | None]:
+    db_mtime = DB_FILE.stat().st_mtime if DB_FILE.exists() else None
+    cache_mtime = CACHE_FILE.stat().st_mtime if CACHE_FILE.exists() else None
+    return db_mtime, cache_mtime
+
+
 @st.cache_data(show_spinner=False)
-def load_latest_data() -> pd.DataFrame:
+def load_latest_data(_version: tuple[float | None, float | None]) -> pd.DataFrame:
     if DB_FILE.exists():
         with sqlite3.connect(DB_FILE) as conn:
             try:
@@ -264,11 +270,15 @@ def filter_by_sector_and_search(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.header("Universe")
     sectors = sorted(df.get("sector", pd.Series(dtype=str)).dropna().astype(str).unique())
     selected = st.sidebar.multiselect("Sectors", sectors, default=[])
+    themes = st.sidebar.text_input("Theme keywords", help="Examples: ai, data center, solar, defense")
     query = st.sidebar.text_input("Ticker, company, or industry")
 
     out = df.copy()
     if selected:
         out = out[out["sector"].isin(selected)]
+    if themes:
+        keywords = screener.expand_themes(themes)
+        out = screener.apply_theme_filter(out, keywords)
     if query:
         q = query.strip().lower()
         haystack = (
@@ -325,13 +335,17 @@ def main() -> None:
     st.set_page_config(page_title="Stock Screener", page_icon="$", layout="wide")
     st.title("Stock Screener")
 
-    full = load_latest_data()
+    version = data_version()
+    full = load_latest_data(version)
     if full.empty:
         st.error("No screener data found. Run `python screener.py` once to fetch data.")
         return
 
     full = add_momentum_columns(clean_for_filters(full))
     st.caption(f"Latest data: {latest_timestamp(full)}")
+    if st.button("Refresh data"):
+        load_latest_data.clear()
+        st.rerun()
 
     filters = build_filter_controls()
     scoped = filter_by_sector_and_search(full)
