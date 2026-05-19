@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# Generated screener outputs
+screener_*.xlsx
+winners_latest.txt
+screener_data.db
+_fetch_cache*.parquet
+_edgar_cache/
+
+# Local/editor noise
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+~$*.xlsx
