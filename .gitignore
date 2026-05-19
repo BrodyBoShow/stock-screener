@@ -9,6 +9,7 @@ _fetch_cache*.parquet
 _edgar_cache/
 
 # Local/editor noise
+.claude/
 .venv/
 venv/
 .env
