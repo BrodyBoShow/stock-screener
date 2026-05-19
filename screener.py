@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 ROOT = Path(__file__).parent
 TICKERS_FILE = ROOT / "tickers.txt"
 DB_FILE = ROOT / "screener_data.db"
-EXCEL_FILE = ROOT / f"screener_{datetime.now():%Y%m%d_%H%M}.xlsx"
+EXCEL_FILE = ROOT / f"screener_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
 
 MAX_WORKERS = 20          # concurrent yfinance fetches — 20 is the sweet spot
 PROGRESS_EVERY = 100      # print a progress line every N tickers
@@ -1368,15 +1368,27 @@ def _build_summary(hits: pd.DataFrame, full: pd.DataFrame, themes: list[str]) ->
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
 
-def export_excel(full: pd.DataFrame, hits: pd.DataFrame, themes: list[str]) -> None:
+def _available_excel_path(path: Path) -> Path:
+    """Return a non-existing Excel path near the requested path."""
+    if not path.exists():
+        return path
+    for i in range(1, 100):
+        candidate = path.with_name(f"{path.stem}_{i}.xlsx")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem}_{datetime.now():%H%M%S}.xlsx")
+
+
+def export_excel(full: pd.DataFrame, hits: pd.DataFrame, themes: list[str]) -> Path:
     # Reorder hits columns for analysis-friendly layout
     hit_cols = [c for c in HIT_COL_ORDER if c in hits.columns]
     extra = [c for c in hits.columns if c not in hit_cols]
     hits_view = hits[hit_cols + extra]
 
     summary = _build_summary(hits, full, themes)
+    output_file = _available_excel_path(EXCEL_FILE)
 
-    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="Summary", index=False)
         hits_view.to_excel(writer, sheet_name="Screened Hits", index=False)
         full.to_excel(writer, sheet_name="All Data", index=False)
@@ -1394,7 +1406,8 @@ def export_excel(full: pd.DataFrame, hits: pd.DataFrame, themes: list[str]) -> N
         _format_sheet(wb["Screened Hits"], hits_view)
         _format_sheet(wb["All Data"], full)
 
-    print(f"Wrote {EXCEL_FILE.name} — {len(hits)} hits / {len(full)} total")
+    print(f"Wrote {output_file.name} - {len(hits)} hits / {len(full)} total")
+    return output_file
 
 
 # ---------- Main ----------
@@ -1419,7 +1432,7 @@ def main() -> None:
             "beta", "pct_below_52w_high", "pct_above_52w_low", "marketCap"]
     print(hits[cols].head(20).to_string(index=False))
 
-    export_excel(clean, hits, theme_keywords)
+    excel_file = export_excel(clean, hits, theme_keywords)
 
     # Also dump a plain-text winners list for quick scanning
     winners_file = ROOT / "winners_latest.txt"
@@ -1433,7 +1446,7 @@ def main() -> None:
     # Auto-open the Excel dashboard on Windows
     if sys.platform == "win32" and os.environ.get("SCREENER_NO_OPEN") != "1":
         try:
-            os.startfile(EXCEL_FILE)
+            os.startfile(excel_file)
         except Exception as e:
             print(f"(Could not auto-open Excel: {e})")
 
