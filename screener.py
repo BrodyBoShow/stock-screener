@@ -997,9 +997,9 @@ def fetch_all(tickers: list[str]) -> pd.DataFrame:
     tickers = list(tickers)
     total = len(tickers)
     workers = MAX_WORKERS
-    if total > 3000 and "SCREENER_MAX_WORKERS" not in os.environ:
+    if total > 1000 and "SCREENER_MAX_WORKERS" not in os.environ:
         workers = min(workers, 5)
-    if total > 2000:
+    if total > 500:
         rng = random.Random(SHUFFLE_SEED)
         rng.shuffle(tickers)
         print(f"Shuffled large universe with seed {SHUFFLE_SEED} to avoid alphabet bias.")
